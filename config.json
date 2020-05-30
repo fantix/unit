@@ -1,0 +1,15 @@
+{
+  "listeners": {
+    "127.0.0.1:8300": {
+      "pass": "applications/sample"
+    }
+  },
+  "applications": {
+    "sample": {
+      "type": "python",
+      "interface": "asgi",
+      "module": "wsgi",
+      "path": "."
+    }
+  }
+}

@@ -8,6 +8,8 @@
 
 #include <Python.h>
 
+#include <unistd.h>
+
 #include <compile.h>
 #include <node.h>
 
@@ -19,6 +21,7 @@
 #include <nxt_unit_request.h>
 #include <nxt_unit_response.h>
 #include <nxt_python_mounts.h>
+#include <nxt_python_asgi.h>
 
 /*
  * According to "PEP 3333 / A Note On String Types"
@@ -235,6 +238,7 @@ nxt_python_start(nxt_task_t *task, nxt_process_data_t *data)
     char                   *path;
     size_t                 size;
     nxt_int_t              pep405;
+    int                    asgi = 0;
 
     static const char pyvenv[] = "/pyvenv.cfg";
     static const char bin_python[] = "/bin/python";
@@ -245,6 +249,11 @@ nxt_python_start(nxt_task_t *task, nxt_process_data_t *data)
 
     if (c->module.length == 0) {
         nxt_alert(task, "python module is empty");
+        return NXT_ERROR;
+    }
+
+    if (PyImport_AppendInittab("nxt_python_asgi", PyInit_nxt_python_asgi) == -1) {
+        nxt_alert(task, "could not extend in-built modules table");
         return NXT_ERROR;
     }
 
@@ -299,6 +308,18 @@ nxt_python_start(nxt_task_t *task, nxt_process_data_t *data)
         nxt_memcpy(nxt_py_home, c->home, len + 1);
         Py_SetPythonHome(nxt_py_home);
 #endif
+    }
+
+    if (c->interface.length > 0) {
+        nxt_py_module = nxt_alloca(c->interface.length + 1);
+        nxt_memcpy(nxt_py_module, c->interface.start, c->interface.length);
+        nxt_py_module[c->interface.length] = '\0';
+        if (nxt_strcasecmp((u_char*)nxt_py_module, (u_char*)"asgi") == 0) {
+            asgi = 1;
+        } else if (nxt_strcasecmp((u_char*)nxt_py_module, (u_char*)"wsgi") != 0) {
+            nxt_alert(task, "Unsupported Python interface \"%s\"", nxt_py_module);
+            return NXT_ERROR;
+        }
     }
 
     Py_InitializeEx(0);
@@ -421,7 +442,26 @@ nxt_python_start(nxt_task_t *task, nxt_process_data_t *data)
 
     nxt_unit_default_init(task, &python_init);
 
-    python_init.callbacks.request_handler = nxt_python_request_handler;
+    if (asgi) {
+        nxt_alert(task, "Install loop");
+        obj = PyImport_ImportModule("nxt_python_asgi");
+        if (!obj) {
+            Py_CLEAR(obj);
+            nxt_alert(task, "could not import module 'nxt_python_asgi'");
+            nxt_python_print_exception();
+            goto fail;
+        }
+
+        rc = nxt_python_asgi_install_loop(task->thread->engine);
+        nxt_alert(task, "Install loop done: %d", rc);
+        if (rc != NXT_UNIT_OK) {
+            nxt_alert(task, "Failed to install event loop for Python ASGI.");
+            nxt_python_print_exception();
+            goto fail;
+        }
+        python_init.callbacks.request_handler = nxt_python_asgi_request_handler;
+    } else
+        python_init.callbacks.request_handler = nxt_python_request_handler;
     python_init.shm_limit = data->app->shm_limit;
 
     unit_ctx = nxt_unit_init(&python_init);
@@ -1351,7 +1391,7 @@ nxt_py_input_readlines(nxt_py_input_t *self, PyObject *args)
             return res;
         }
 
-        PyList_Append(res, line);	
+        PyList_Append(res, line);
         Py_DECREF(line);
     }
 
